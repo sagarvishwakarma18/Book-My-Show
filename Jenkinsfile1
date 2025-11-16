@@ -1,112 +1,158 @@
 (without K8S Stage)
+
 pipeline {
-    agent any
-    tools {
-        jdk 'jdk17'
-        nodejs 'node23'
+  agent any
+  tools {
+    jdk 'jdk17'
+    nodejs 'node23'
+  }
+  environment {
+    SCANNER_HOME = tool 'sonar-scanner'   // keep as-is
+  }
+  stages {
+    stage('Clean Workspace') {
+      steps {
+        cleanWs()
+      }
     }
-    environment {
-        SCANNER_HOME = tool 'sonar-scanner'
+
+    stage('Checkout from Git') {
+      steps {
+        git branch: 'main', url: 'https://github.com/sagarvishwakarma18/Book-My-Show.git'
+        sh 'ls -la'  // Verify files after checkout
+      }
     }
-    stages {
-        stage('Clean Workspace') {
-            steps {
-                cleanWs()
-            }
-        }
-        stage('Checkout from Git') {
-            steps {
-                git branch: 'main', url: 'https://github.com/sagarvishwakarma18/Book-My-Show.git'
-                sh 'ls -la'  // Verify files after checkout
-            }
-        }
-        stage('SonarQube Analysis') {
-            steps {
-                withSonarQubeEnv('sonar-server') {
-                    sh ''' 
-                    $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=BMS \
-                    -Dsonar.projectKey=BMS 
-                    '''
-                }
-            }
-        }
-        stage('Quality Gate') {
-            steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
-                }
-            }
-        }
-        stage('Install Dependencies') {
-            steps {
-                sh '''
-                cd bookmyshow-app
-                ls -la  # Verify package.json exists
-                if [ -f package.json ]; then
-                    rm -rf node_modules package-lock.json  # Remove old dependencies
-                    npm install  # Install fresh dependencies
-                else
-                    echo "Error: package.json not found in bookmyshow-app!"
-                    exit 1
-                fi
-                '''
-            }
-        }
-        stage('OWASP FS Scan') {
-            steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-            }
-        }
-        stage('Trivy FS Scan') {
-            steps {
-                sh 'trivy fs . > trivyfs.txt'
-            }
-        }
-        stage('Docker Build & Push') {
-            steps {
-                script {
-                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                        sh ''' 
-                        echo "Building Docker image..."
-                        docker build --no-cache -t sagar18v/bms:latest -f bookmyshow-app/Dockerfile bookmyshow-app
 
-                        echo "Pushing Docker image to registry..."
-                        docker push sagar18v/bms:latest
-                        '''
-                    }
-                }
-            }
+    stage('SonarQube Analysis') {
+      steps {
+        // Make sure 'sonar-server' is the SonarQube server name configured in Jenkins
+        withSonarQubeEnv('sonar-server') {
+          sh '''
+            echo "Running Sonar scanner..."
+            $SCANNER_HOME/bin/sonar-scanner \
+              -Dsonar.projectKey=BMS \
+              -Dsonar.projectName=BMS \
+              -Dsonar.sources=.
+          '''
         }
-        stage('Deploy to Container') {
-            steps {
-                sh ''' 
-                echo "Stopping and removing old container..."
-                docker stop bms || true
-                docker rm bms || true
-
-                echo "Running new container on port 3000..."
-                docker run -d --restart=always --name bms -p 3000:3000 sagar18v/bms:latest
-
-                echo "Checking running containers..."
-                docker ps -a
-
-                echo "Fetching logs..."
-                sleep 5  # Give time for the app to start
-                docker logs bms
-                '''
-            }
-        }
+      }
     }
-    post {
-        always {
-            emailext attachLog: true,
-                subject: "'${currentBuild.result}'",
-                body: "Project: ${env.JOB_NAME}<br/>" +
-                      "Build Number: ${env.BUILD_NUMBER}<br/>" +
-                      "URL: ${env.BUILD_URL}<br/>",
-                to: 'sagarvishwakarma28719@gmail.com',
-                attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+
+    stage('Quality Gate') {
+      steps {
+        script {
+          // waitForQualityGate returns a map with a status field — handle it explicitly
+          // This waits for SonarQube analysis to complete on the Sonar server and fetches the gate result
+          timeout(time: 5, unit: 'MINUTES') {
+            def qg = waitForQualityGate()
+            echo "SonarQube quality gate status: ${qg.status}"
+            if (qg.status != 'OK') {
+              // Fail the build or set appropriate behavior
+              error "Quality gate failed with status: ${qg.status}"
+            }
+          }
         }
+      }
     }
+
+    stage('Install Dependencies') {
+      steps {
+        dir('bookmyshow-app') {
+          sh '''
+            ls -la  # Verify package.json exists
+            if [ -f package.json ]; then
+              rm -rf node_modules package-lock.json
+              # prefer npm ci in CI environments if package-lock.json present; fallback to npm install
+              if [ -f package-lock.json ]; then
+                 npm ci
+              else
+                 npm install
+              fi
+            else
+              echo "Error: package.json not found in bookmyshow-app!"
+              exit 1
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('OWASP FS Scan') {
+      steps {
+        dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+        dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+      }
+    }
+
+    stage('Trivy FS Scan') {
+      steps {
+        sh '''
+          set -o pipefail
+          echo "Running Trivy filesystem scan..."
+          trivy fs --no-progress --quiet . > trivyfs.txt || true
+          echo "Trivy FS scan output saved to trivyfs.txt"
+        '''
+      }
+    }
+
+    stage('Docker Build & Push') {
+      steps {
+        script {
+          // Tag the image with build number for traceability
+          def tag = "sagar18v/bms:${env.BUILD_NUMBER ?: 'latest'}"
+          echo "Image tag will be: ${tag}"
+
+          // Use Docker pipeline helper which respects withRegistry and Jenkins credentials
+          docker.withRegistry('', 'docker') { // '' -> default registry (Docker Hub). 'docker' is credentialsId in Jenkins
+            // Build using the Docker Pipeline API (returns docker.Image)
+            def built = docker.build(tag, "-f bookmyshow-app/Dockerfile bookmyshow-app")
+            echo "Pushing ${tag}..."
+            built.push()
+            // Optionally push latest tag as well
+            echo "Also pushing :latest tag..."
+            built.push('latest')
+          }
+        }
+      }
+    }
+
+    stage('Deploy to Container') {
+      steps {
+        script {
+          // NOTE: This will run docker on the Jenkins agent. If you want to deploy to a remote host,
+          // use SSH to remote host and docker pull/run there (example below in comments).
+          def tag = "sagar18v/bms:${env.BUILD_NUMBER ?: 'latest'}"
+          sh """
+            set -e
+            echo "Stopping previous container (if exists)..."
+            docker stop bms || true
+            docker rm bms || true
+
+            echo "Running new container from image ${tag}..."
+            docker run -d --restart=always --name bms -p 3000:3000 ${tag}
+
+            echo "Containers running:"
+            docker ps -a
+
+            echo "Sleeping 10s to gather logs..."
+            sleep 10
+            echo "Last 200 lines of logs for bms:"
+            docker logs --tail 200 bms || true
+          """
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      emailext attachLog: true,
+              subject: "'${currentBuild.result}'",
+              body: """Project: ${env.JOB_NAME}<br/>
+                       Build Number: ${env.BUILD_NUMBER}<br/>
+                       URL: ${env.BUILD_URL}<br/>""",
+              to: 'sagarvishwakarma28719@gmail.com',
+              attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+    }
+  }
 }
